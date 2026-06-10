@@ -6,6 +6,9 @@
 name: Build Arch Linux ARM arm64 server image
 
 on:
+  push:
+    branches:
+      - archlinuxarm
   repository_dispatch:
   workflow_dispatch:
     inputs:
