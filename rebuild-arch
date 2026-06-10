@@ -129,9 +129,15 @@ EOF
 
 cleanup_mounts() {
     sync 2>/dev/null || true
-    [[ -n "${tag_bootfs:-}" ]] && umount -f "${tag_bootfs}" 2>/dev/null || true
-    [[ -n "${tag_rootfs:-}" ]] && umount -f "${tag_rootfs}" 2>/dev/null || true
-    [[ -n "${loop_new:-}" ]] && losetup -d "${loop_new}" 2>/dev/null || true
+    if [[ -n "${tag_bootfs:-}" ]]; then
+        umount -f "${tag_bootfs}" 2>/dev/null || true
+    fi
+    if [[ -n "${tag_rootfs:-}" ]]; then
+        umount -f "${tag_rootfs}" 2>/dev/null || true
+    fi
+    if [[ -n "${loop_new:-}" ]]; then
+        losetup -d "${loop_new}" 2>/dev/null || true
+    fi
 }
 
 trap cleanup_mounts EXIT
