@@ -1,0 +1,1080 @@
+#!/bin/bash
+#================================================================================================
+#
+# This file is licensed under the terms of the GNU General Public
+# License version 2. This program is licensed "as is" without any
+# warranty of any kind, whether express or implied.
+#
+# This file is a part of the Rebuild Armbian project.
+# Description: Build minimal Arch Linux ARM images with existing ophub boot assets.
+#
+# Default target for phase 1: Beelink-Mini-MX-2G (BOARD=s905-beelink-mini).
+#
+#================================================================================================
+
+set -o pipefail
+
+# Related file storage path
+current_path="${PWD}"
+armbian_outputpath="${current_path}/build/output/images"
+build_path="${current_path}/build-armbian"
+arch_build_path="${current_path}/build-archlinuxarm"
+arch_files="${arch_build_path}/arch-files"
+arch_common_files="${arch_files}/common-files"
+arch_platform_files="${arch_files}/platform-files"
+kernel_path="${build_path}/kernel"
+uboot_path="${build_path}/u-boot"
+common_files="${build_path}/armbian-files/common-files"
+platform_files="${build_path}/armbian-files/platform-files"
+different_files="${build_path}/armbian-files/different-files"
+model_conf="${common_files}/etc/model_database.conf"
+firmware_path="${common_files}/usr/lib/firmware"
+tmp_dir="${current_path}/build/tmp_archlinuxarm"
+tmp_outpath="${tmp_dir}/tmp_out"
+tmp_build="${tmp_dir}/tmp_build"
+rootfs_cache="${arch_build_path}/rootfs"
+
+# Arch Linux ARM rootfs
+arch_rootfs_url="https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+arch_rootfs_file="${rootfs_cache}/ArchLinuxARM-aarch64-latest.tar.gz"
+custom_rootfs="no"
+
+# U-Boot and firmware repositories
+uboot_repo="https://github.com/ophub/u-boot"
+firmware_repo="https://github.com/ophub/firmware"
+
+# Kernel repository and defaults
+kernel_repo="https://github.com/ophub/kernel"
+default_tags="stable"
+kernel_usage=""
+stable_kernel=("6.12.y" "6.18.y")
+flippy_kernel=("${stable_kernel[@]}")
+beta_kernel=("${stable_kernel[@]}")
+# Kernel arrays below are referenced indirectly from KERNEL_TAGS via eval.
+# shellcheck disable=SC2034
+rk3588_kernel=("6.1.y")
+# shellcheck disable=SC2034
+rk35xx_kernel=("6.1.y")
+# shellcheck disable=SC2034
+h6_kernel=("6.6.y")
+specific_6xy=("6.1.y" "6.6.y" "6.12.y" "6.18.y")
+specific_5xy=("5.10.y" "5.15.y")
+specific_kernel=()
+auto_kernel="true"
+custom_kernel_set="false"
+auto_kernel_set="false"
+declare -A tags_list
+
+# Phase 1 target device
+target_model="Beelink-Mini-MX-2G"
+default_board="s905-beelink-mini"
+build_board="${default_board}"
+
+# Image options
+boot_mb="512"
+root_mb="3000"
+rootfs_type="ext4"
+os_type="server"
+builder_name=""
+
+# Runtime defaults
+arch_release_version="rolling"
+release_codeid="archlinuxarm"
+release_codename="rolling"
+
+# Color labels
+STEPS="[\033[95m STEPS \033[0m]"
+INFO="[\033[94m INFO \033[0m]"
+WARNING="[\033[93m WARNING \033[0m]"
+SUCCESS="[\033[92m SUCCESS \033[0m]"
+ERROR="[\033[91m ERROR \033[0m]"
+
+error_msg() {
+    echo -e "${ERROR} ${1}" >&2
+    exit 1
+}
+
+process_msg() {
+    echo -e "${STEPS} ${1}"
+}
+
+print_usage() {
+    cat <<EOF
+Usage: sudo ./rebuild-arch [options]
+
+Build a minimal Arch Linux ARM SD/USB image using existing ophub boot assets.
+
+Default target:
+  ${target_model} (BOARD=${default_board})
+
+Options:
+  -b, --Board <board|model>            Target board or model name. Default: ${default_board}
+  -f, --rootfs <tarball>               Use a local ArchLinuxARM rootfs tarball
+  -d, --rootfsUrl <url>                Download rootfs from a custom URL
+  -r, --kernelRepository <repo|url>    Kernel repository. Default: ${kernel_repo}
+  -u, --kernelUsage <tag>              Replace default kernel tag, for example stable/beta/flippy
+  -k, --Kernel <ver[_ver...]>          Build specific kernel version(s), for example 6.12.69
+  -a, --Autokernel <true|false>        Query latest matching kernel automatically. Default: true
+  -t, --rootfsType <ext4|btrfs>        ROOTFS filesystem type. Default: ext4
+  -s, --Size <boot/root|root>          Partition size in MiB. Default: 512/3000
+  -n, --BuilderName <name>             Builder signature for /etc/ophub-release
+  -h, --help                           Show this help
+
+Examples:
+  sudo ./rebuild-arch
+  sudo ./rebuild-arch -f build-archlinuxarm/rootfs/ArchLinuxARM-aarch64-latest.tar.gz
+  sudo ./rebuild-arch -k 6.12.69 -s 512/4096
+EOF
+}
+
+cleanup_mounts() {
+    sync 2>/dev/null || true
+    [[ -n "${tag_bootfs:-}" ]] && umount -f "${tag_bootfs}" 2>/dev/null || true
+    [[ -n "${tag_rootfs:-}" ]] && umount -f "${tag_rootfs}" 2>/dev/null || true
+    [[ -n "${loop_new:-}" ]] && losetup -d "${loop_new}" 2>/dev/null || true
+}
+
+trap cleanup_mounts EXIT
+
+clean_model_conf() {
+    [[ -f "${model_conf}" ]] || return 1
+    sed -e 's/NA//g' -e 's/NULL//g' -e 's/[ ][ ]*//g' "${model_conf}" | grep -E '^[^#].+'
+}
+
+mount_try() {
+    local m_type="${1}"
+    local m_dev="${2}"
+    local m_target="${3}"
+    [[ -n "${m_type}" && -n "${m_dev}" && -n "${m_target}" ]] || {
+        error_msg "Mount parameter is missing: [ ${m_type}, ${m_dev}, ${m_target} ]"
+    }
+
+    local t=1
+    local max_try=10
+    while [[ "${t}" -le "${max_try}" ]]; do
+        if [[ "${m_type}" == "btrfs" ]]; then
+            mount -t "${m_type}" -o discard,compress=zstd:6 "${m_dev}" "${m_target}" 2>/dev/null && return 0
+        else
+            mount -t "${m_type}" -o discard "${m_dev}" "${m_target}" 2>/dev/null && return 0
+        fi
+
+        sync
+        umount -l "${m_target}" 2>/dev/null || true
+        sleep 3
+        ((t++))
+    done
+    error_msg "[ ${max_try} ] attempts to mount [ ${m_dev} -> ${m_target} ] failed."
+}
+
+get_textoffset() {
+    local vmlinuz_name="${1}"
+    need_overload="yes"
+    [[ -f "${vmlinuz_name}" ]] || return 0
+    [[ "$(hexdump -n 15 -x "${vmlinuz_name}" 2>/dev/null | awk 'NR==1 {print $7}')" == "0108" ]] && need_overload="no"
+}
+
+resolve_board_name() {
+    local query="${1}"
+    local resolved=""
+    resolved="$(clean_model_conf | awk -F':' -v q="${query}" '($2 == q || $14 == q) {print $14; exit}')"
+    [[ -n "${resolved}" ]] || return 1
+    printf '%s\n' "${resolved}"
+}
+
+init_var() {
+    local options="b:r:u:k:a:t:s:n:f:d:h"
+    local long_options="Board:,kernelRepository:,kernelUsage:,Kernel:,Autokernel:,rootfsType:,Size:,BuilderName:,rootfs:,rootfsUrl:,help"
+    local parsed_args
+    if ! parsed_args=$(getopt -o "${options}" -l "${long_options}" -- "${@}"); then
+        error_msg "Parameter parsing failed."
+    fi
+    eval set -- "${parsed_args}"
+
+    while true; do
+        case "${1}" in
+        -b | --Board)
+            [[ -n "${2}" ]] || error_msg "Invalid -b parameter [ ${2} ]!"
+            build_board="${2// /}"
+            shift 2
+            ;;
+        -r | --kernelRepository)
+            [[ -n "${2}" ]] || error_msg "Invalid -r parameter [ ${2} ]!"
+            kernel_repo="${2}"
+            shift 2
+            ;;
+        -u | --kernelUsage)
+            [[ -n "${2}" ]] || error_msg "Invalid -u parameter [ ${2} ]!"
+            kernel_usage="${2//kernel_/}"
+            shift 2
+            ;;
+        -k | --Kernel)
+            [[ -n "${2}" ]] || error_msg "Invalid -k parameter [ ${2} ]!"
+            oldIFS="${IFS}"
+            IFS="_"
+            read -ra specific_kernel <<<"${2}"
+            IFS="${oldIFS}"
+            stable_kernel=("${specific_kernel[@]}")
+            # shellcheck disable=SC2034
+            flippy_kernel=("${specific_kernel[@]}")
+            # shellcheck disable=SC2034
+            beta_kernel=("${specific_kernel[@]}")
+            custom_kernel_set="true"
+            shift 2
+            ;;
+        -a | --Autokernel)
+            [[ -n "${2}" ]] || error_msg "Invalid -a parameter [ ${2} ]!"
+            auto_kernel="${2}"
+            auto_kernel_set="true"
+            shift 2
+            ;;
+        -t | --rootfsType)
+            [[ -n "${2}" ]] || error_msg "Invalid -t parameter [ ${2} ]!"
+            rootfs_type="${2}"
+            shift 2
+            ;;
+        -s | --Size)
+            [[ -n "${2}" ]] || error_msg "Invalid -s parameter [ ${2} ]!"
+            img_mb="${2}"
+            shift 2
+            ;;
+        -n | --BuilderName)
+            [[ -n "${2}" ]] || error_msg "Invalid -n parameter [ ${2} ]!"
+            builder_name="${2// /}"
+            shift 2
+            ;;
+        -f | --rootfs)
+            [[ -n "${2}" ]] || error_msg "Invalid -f parameter [ ${2} ]!"
+            if [[ "${2}" = /* ]]; then
+                arch_rootfs_file="${2}"
+            else
+                arch_rootfs_file="${current_path}/${2}"
+            fi
+            custom_rootfs="yes"
+            shift 2
+            ;;
+        -d | --rootfsUrl)
+            [[ -n "${2}" ]] || error_msg "Invalid -d parameter [ ${2} ]!"
+            arch_rootfs_url="${2}"
+            shift 2
+            ;;
+        -h | --help)
+            print_usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            [[ -n "${1}" ]] && error_msg "Invalid option [ ${1} ]!"
+            break
+            ;;
+        esac
+    done
+
+    [[ "${custom_kernel_set}" == "true" && "${auto_kernel_set}" != "true" ]] && auto_kernel="false"
+
+    if [[ -n "${img_mb:-}" ]]; then
+        if [[ "${img_mb}" =~ / ]]; then
+            boot_mb="${img_mb%%/*}"
+            root_mb="${img_mb##*/}"
+        else
+            root_mb="${img_mb}"
+        fi
+    fi
+
+    [[ "${boot_mb}" =~ ^[0-9]+$ && "${boot_mb}" -ge 256 ]] || error_msg "Invalid boot partition size: [ ${boot_mb} ]"
+    [[ "${root_mb}" =~ ^[0-9]+$ && "${root_mb}" -ge 2048 ]] || error_msg "Invalid rootfs partition size: [ ${root_mb} ]"
+    [[ "${rootfs_type}" =~ ^(ext4|btrfs)$ ]] || error_msg "Unsupported rootfs type: [ ${rootfs_type} ]"
+}
+
+check_host() {
+    [[ "$(id -u)" == 0 ]] || error_msg "Please run this script as root: [ sudo ./rebuild-arch ]"
+    [[ -f "${model_conf}" ]] || error_msg "Missing model config file: [ ${model_conf} ]"
+    [[ -d "${platform_files}" ]] || error_msg "Missing platform files: [ ${platform_files} ]"
+
+    mkdir -p "${armbian_outputpath}" "${rootfs_cache}"
+
+    local required_cmds=(awk curl dd df find git grep gzip hexdump losetup mount mkfs.ext4 mkfs.vfat parted sed sha256sum sort tar umount wc xargs)
+    [[ "${rootfs_type}" == "btrfs" ]] && required_cmds+=(mkfs.btrfs)
+    local missing_cmds=()
+    local cmd
+    for cmd in "${required_cmds[@]}"; do
+        command -v "${cmd}" >/dev/null 2>&1 || missing_cmds+=("${cmd}")
+    done
+    [[ "${#missing_cmds[@]}" -eq 0 ]] || error_msg "Missing required commands: [ ${missing_cmds[*]} ]"
+}
+
+check_data() {
+    local requested_boards=()
+    local resolved_boards=()
+    local item resolved board_kernel
+
+    if [[ "${build_board}" == "all" ]]; then
+        build_board="${default_board}"
+        echo -e "${WARNING} Arch phase 1 is limited; using default target [ ${target_model} / ${default_board} ]."
+    fi
+
+    oldIFS="${IFS}"
+    IFS="_"
+    read -ra requested_boards <<<"${build_board}"
+    IFS="${oldIFS}"
+
+    for item in "${requested_boards[@]}"; do
+        [[ -n "${item}" ]] || continue
+        resolved="$(resolve_board_name "${item}")" || error_msg "Board/model config is missing: [ ${item} ]"
+        if [[ " ${resolved_boards[*]} " != *" ${resolved} "* ]]; then
+            resolved_boards+=("${resolved}")
+        fi
+    done
+    [[ "${#resolved_boards[@]}" -gt 0 ]] || error_msg "The [ BOARD ] is missing, stop building."
+    build_arch=("${resolved_boards[@]}")
+
+    kernel_from=()
+    for item in "${build_arch[@]}"; do
+        board_kernel="$(clean_model_conf | awk -F':' -v q="${item}" '($14 == q) {print $9; exit}')"
+        [[ -n "${board_kernel}" ]] || error_msg "Missing [ KERNEL_TAGS ] for [ ${item} ]."
+        kernel_from+=("${board_kernel}")
+    done
+    mapfile -t kernel_from < <(printf '%s\n' "${kernel_from[@]}" | sort -u)
+    [[ "${#kernel_from[@]}" -gt 0 ]] || error_msg "Missing [ KERNEL_TAGS ] settings, stop building."
+
+    [[ -n "${kernel_usage}" ]] && {
+        for ((i = 0; i < ${#kernel_from[@]}; i++)); do
+            if [[ ${kernel_from[${i}]} == "${default_tags}/"* ]]; then
+                kernel_from[i]="${kernel_from[i]//${default_tags}/${kernel_usage}}"
+            fi
+        done
+    }
+
+    local key kernel_value value_items value_list unique_values
+    for item in "${kernel_from[@]}"; do
+        value_items=()
+        IFS='/' read -r key kernel_value <<<"${item}"
+        if [[ "${kernel_value}" == "all" ]]; then
+            eval "value_items=(\"\${${key}_kernel[@]}\")"
+        elif [[ "${kernel_value}" =~ ^[1-9]+ ]]; then
+            if [[ "${kernel_value}" == "5.x.y" ]]; then
+                value_items=("${specific_5xy[@]}")
+            elif [[ "${kernel_value}" == "6.x.y" ]]; then
+                value_items=("${specific_6xy[@]}")
+            else
+                IFS='_' read -ra value_items <<<"${kernel_value}"
+            fi
+        fi
+
+        if [[ ! "${auto_kernel}" =~ ^(true|yes)$ ]]; then
+            [[ "${#specific_kernel[@]}" -gt 0 ]] || error_msg "Please use the -k parameter to specify the kernel version."
+            value_items=("${specific_kernel[@]}")
+        fi
+
+        value_list="${value_items[*]}"
+
+        if [[ -n "${tags_list[${key}]}" ]]; then
+            tags_list[${key}]+=" ${value_list}"
+        else
+            tags_list[${key}]="${value_list}"
+        fi
+    done
+
+    for key in "${!tags_list[@]}"; do
+        read -ra unique_values <<<"$(printf '%s\n' "${tags_list[${key}]}" | xargs -n1 | sort -u | xargs)"
+        tags_list[${key}]="${unique_values[*]}"
+    done
+    [[ "${#tags_list[@]}" -gt 0 ]] || error_msg "The [ tags_list ] is missing, stop building."
+
+    [[ "${kernel_repo}" =~ ^https?:// ]] && kernel_repo="$(echo "${kernel_repo}" | awk -F'/' '{print $4"/"$5}')"
+    kernel_api="https://github.com/${kernel_repo}"
+}
+
+download_arch_rootfs() {
+    process_msg "Downloading Arch Linux ARM rootfs."
+    if [[ -s "${arch_rootfs_file}" ]]; then
+        echo -e "${INFO} Arch Linux ARM rootfs exists: [ ${arch_rootfs_file} ]"
+        return 0
+    fi
+
+    [[ "${custom_rootfs}" == "yes" ]] && error_msg "Custom rootfs file does not exist: [ ${arch_rootfs_file} ]"
+
+    mkdir -p "$(dirname "${arch_rootfs_file}")"
+    echo -e "${INFO} Rootfs download from [ ${arch_rootfs_url} ]"
+    local download_ok=0
+    for _ in {1..10}; do
+        if curl -fL "${arch_rootfs_url}" -o "${arch_rootfs_file}"; then
+            download_ok=1
+            break
+        fi
+        sleep 60
+    done
+    [[ "${download_ok}" -eq 1 ]] || error_msg "Failed to download Arch Linux ARM rootfs."
+}
+
+git_pull_dir() {
+    local git_repo="${1}"
+    local git_branch="${2}"
+    local git_dir="${3}"
+    local git_path="${4}"
+    [[ -n "${git_repo}" && -n "${git_branch}" && -n "${git_dir}" && -n "${git_path}" ]] || {
+        error_msg "git_pull_dir parameter is missing: [ ${git_repo}, ${git_branch}, ${git_dir}, ${git_path} ]"
+    }
+
+    local git_tmp_path clone_ok
+    git_tmp_path="$(mktemp -d)"
+    clone_ok=0
+    for _ in {1..10}; do
+        if git clone --quiet --single-branch --depth=1 --branch="${git_branch}" "${git_repo}" "${git_tmp_path}"; then
+            clone_ok=1
+            break
+        fi
+        sleep 60
+    done
+    [[ "${clone_ok}" -eq 1 ]] || error_msg "Failed to clone the [ ${git_repo} ] repository."
+
+    mkdir -p "${git_path}"
+    cp -af --no-preserve=ownership "${git_tmp_path}/${git_dir}/." "${git_path}" ||
+        error_msg "Failed to move the [ ${git_dir} ] files to the [ ${git_path} ] directory."
+    rm -rf "${git_tmp_path}" 2>/dev/null
+}
+
+download_depends() {
+    process_msg "Downloading dependency files."
+
+    local uboot_num firmware_num
+    uboot_num="$(find "${uboot_path}/amlogic" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    if [[ -z "${uboot_num}" || "${uboot_num}" -le "1" ]]; then
+        git_pull_dir "${uboot_repo}" main u-boot "${uboot_path}"
+        echo -e "${INFO} u-boot download completed."
+    else
+        echo -e "${INFO} u-boot files exist, skip downloading."
+    fi
+
+    firmware_num="$(find "${firmware_path}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    if [[ -z "${firmware_num}" || "${firmware_num}" -le "5" ]]; then
+        git_pull_dir "${firmware_repo}" main firmware "${firmware_path}"
+        echo -e "${INFO} firmware download completed."
+    else
+        echo -e "${INFO} firmware files exist, skip downloading."
+    fi
+}
+
+query_kernel() {
+    process_msg "Querying the latest kernel version."
+
+    local key down_kernel_list kernel_var kernel_verpatch latest_version tmp_arr_kernels i x
+    x="1"
+    for key in "${!tags_list[@]}"; do
+        read -ra down_kernel_list <<<"${tags_list[${key}]}"
+        tmp_arr_kernels=()
+        i=1
+        for kernel_var in "${down_kernel_list[@]}"; do
+            echo -e "${INFO} (${x}.${i}) Auto query the latest kernel version for [ ${key} - ${kernel_var} ]"
+            kernel_verpatch="$(echo "${kernel_var}" | awk -F '.' '{print $1"."$2}')"
+            latest_version="$(
+                curl -fsSL \
+                    "${kernel_api}/releases/expanded_assets/kernel_${key}" |
+                    grep -oP "${kernel_verpatch}\.[0-9]+(?=\.tar\.gz)" |
+                    sort -urV | awk 'NR==1 {print}'
+            )"
+            if [[ -n "${latest_version}" ]]; then
+                tmp_arr_kernels[i]="${latest_version}"
+            else
+                tmp_arr_kernels[i]="${kernel_var}"
+            fi
+            echo -e "${INFO} (${x}.${i}) [ ${key} - ${tmp_arr_kernels[$i]} ] is selected."
+            ((i++))
+        done
+        tags_list[${key}]="${tmp_arr_kernels[*]}"
+        ((x++))
+    done
+}
+
+check_kernel() {
+    local check_path="${1}"
+    [[ -n "${check_path}" && -f "${check_path}/sha256sums" ]] || return 0
+
+    local check_files cf tmp_sha256sum tmp_checkcode
+    mapfile -t check_files < <(awk '{print $2}' "${check_path}/sha256sums")
+    for cf in "${check_files[@]}"; do
+        [[ -s "${check_path}/${cf}" ]] || error_msg "The [ ${cf} ] file is missing."
+        tmp_sha256sum="$(sha256sum "${check_path}/${cf}" | awk '{print $1}')"
+        tmp_checkcode="$(awk -v f="${cf}" '$2 == f {print $1}' "${check_path}/sha256sums")"
+        [[ "${tmp_sha256sum}" == "${tmp_checkcode}" ]] || error_msg "[ ${cf} ]: sha256sum verification failed."
+    done
+    echo -e "${INFO} All [ ${#check_files[@]} ] kernel files are sha256sum checked to be complete."
+}
+
+download_kernel() {
+    process_msg "Downloading kernel files."
+
+    local key down_kernel_list kernel_var kernel_down_from download_ok x i
+    x="1"
+    for key in "${!tags_list[@]}"; do
+        read -ra down_kernel_list <<<"${tags_list[${key}]}"
+        i="1"
+        for kernel_var in "${down_kernel_list[@]}"; do
+            if [[ ! -d "${kernel_path}/${key}/${kernel_var}" ]]; then
+                kernel_down_from="https://github.com/${kernel_repo}/releases/download/kernel_${key}/${kernel_var}.tar.gz"
+                echo -e "${INFO} (${x}.${i}) [ ${key} - ${kernel_var} ] Kernel download from [ ${kernel_down_from} ]"
+
+                mkdir -p "${kernel_path}/${key}"
+                download_ok=0
+                for _ in {1..10}; do
+                    if curl -fsSL "${kernel_down_from}" -o "${kernel_path}/${key}/${kernel_var}.tar.gz"; then
+                        download_ok=1
+                        break
+                    fi
+                    sleep 60
+                done
+                [[ "${download_ok}" -eq 1 ]] || error_msg "Failed to download the kernel files from the server."
+
+                tar -mxzf "${kernel_path}/${key}/${kernel_var}.tar.gz" -C "${kernel_path}/${key}" ||
+                    error_msg "[ ${kernel_var} ] kernel decompression failed."
+            else
+                echo -e "${INFO} (${x}.${i}) [ ${key} - ${kernel_var} ] Kernel is in the local directory."
+            fi
+
+            check_kernel "${kernel_path}/${key}/${kernel_var}"
+            ((i++))
+        done
+        rm -f "${kernel_path}/${key}"/*.tar.gz 2>/dev/null
+        ((x++))
+    done
+}
+
+confirm_version() {
+    board_conf="$(clean_model_conf | awk -F':' -v q="${board}" '($14 == q) {print; exit}')"
+    [[ -n "${board_conf}" ]] || error_msg "[ ${board} ] config is missing!"
+
+    MODEL_ID="$(echo "${board_conf}" | awk -F':' '{print $1}')"
+    MODEL_NAME="$(echo "${board_conf}" | awk -F':' '{print $2}')"
+    SOC="$(echo "${board_conf}" | awk -F':' '{print $3}')"
+    FDTFILE="$(echo "${board_conf}" | awk -F':' '{print $4}')"
+    UBOOT_OVERLOAD="$(echo "${board_conf}" | awk -F':' '{print $5}')"
+    TRUST_IMG="${UBOOT_OVERLOAD}"
+    MAINLINE_UBOOT="$(echo "${board_conf}" | awk -F':' '{print $6}')"
+    BOOTLOADER_IMG="$(echo "${board_conf}" | awk -F':' '{print $7}')"
+    KERNEL_TAGS="$(echo "${board_conf}" | awk -F':' '{print $9}')"
+    PLATFORM="$(echo "${board_conf}" | awk -F':' '{print $10}')"
+    FAMILY="$(echo "${board_conf}" | awk -F':' '{print $11}')"
+    BOOT_CONF="$(echo "${board_conf}" | awk -F':' '{print $12}')"
+    CONTRIBUTORS="$(echo "${board_conf}" | awk -F':' '{print $13}')"
+
+    [[ -n "${PLATFORM}" ]] || error_msg "Invalid PLATFORM parameter: [ ${PLATFORM} ]"
+    [[ "${PLATFORM}" =~ ^(amlogic|rockchip|allwinner)$ ]] || error_msg "[ ${PLATFORM} ] not supported."
+
+    [[ -n "${MAINLINE_UBOOT}" ]] && RECORD_MAINLINE_UBOOT="/usr/lib/u-boot/${MAINLINE_UBOOT}" || RECORD_MAINLINE_UBOOT=""
+    [[ -n "${BOOTLOADER_IMG}" ]] && RECORD_BOOTLOADER_IMG="/usr/lib/u-boot/${BOOTLOADER_IMG}" || RECORD_BOOTLOADER_IMG=""
+    [[ -n "${TRUST_IMG}" ]] && RECORD_TRUST_IMG="/usr/lib/u-boot/${TRUST_IMG}" || RECORD_TRUST_IMG=""
+
+    conf_kernel_tags="${KERNEL_TAGS%%/*}"
+    conf_kernel_list="${KERNEL_TAGS##*/}"
+    [[ -n "${kernel_usage}" && "${conf_kernel_tags}" == "${default_tags}" ]] && conf_kernel_tags="${kernel_usage}"
+    [[ -z "${conf_kernel_tags}" ]] && error_msg "The [ ${KERNEL_TAGS} ] is missing tags part."
+    [[ -z "${conf_kernel_list}" ]] && error_msg "The [ ${KERNEL_TAGS} ] is missing list part."
+
+    model_kernel=()
+    if [[ "${conf_kernel_list}" == "all" ]]; then
+        eval "model_kernel=(\"\${${conf_kernel_tags}_kernel[@]}\")"
+        mapfile -t model_kernel < <(printf '%s\n' "${model_kernel[@]}" | sed -E 's/^([0-9]+\.[0-9]+)(\.[a-z0-9]+)?$/\1.[0-9]+/')
+    else
+        IFS='_' read -ra conf_kernel_list <<<"${conf_kernel_list}"
+        mapfile -t model_kernel < <(printf '%s\n' "${conf_kernel_list[@]}" | sed -E 's/^([0-9]+\.[0-9]+)(\.[a-z0-9]+)?$/\1.[0-9]+/')
+    fi
+    [[ "${#model_kernel[@]}" -gt 0 ]] || error_msg "The kernel list is empty for [ ${board} ]"
+
+    build_kernel=()
+    read -ra latest_kernel <<<"${tags_list[${conf_kernel_tags}]}"
+    local ck lk
+    for ck in "${model_kernel[@]}"; do
+        for lk in "${latest_kernel[@]}"; do
+            [[ "${lk}" =~ ^${ck}$ ]] && build_kernel+=("${lk}")
+        done
+    done
+    [[ "${#build_kernel[@]}" -gt 0 ]] || error_msg "The kernel list is invalid for [ ${board} ]"
+}
+
+make_image() {
+    process_msg "(1/6) Make new Arch Linux ARM image."
+
+    [[ "${PLATFORM}" == "amlogic" ]] && {
+        skip_mb="4"
+        partition_table_type="msdos"
+        bootfs_type="fat32"
+    }
+    [[ "${PLATFORM}" == "rockchip" ]] && {
+        skip_mb="16"
+        partition_table_type="gpt"
+        bootfs_type="ext4"
+    }
+    [[ "${PLATFORM}" == "allwinner" ]] && {
+        skip_mb="16"
+        partition_table_type="msdos"
+        bootfs_type="fat32"
+    }
+
+    write_board_file="no"
+    adjust_kernel_files="no"
+    board_release="${different_files}/${board}/rootfs/etc/armbian-board-release.conf"
+    # shellcheck source=/dev/null
+    [[ -f "${board_release}" ]] && source "${board_release}"
+
+    archlinuxarm_filename="ArchLinuxARM_${PLATFORM}_${board}_${kernel}_${os_type}_$(date +"%Y.%m.%d").img"
+    build_image_file="${tmp_outpath}/${archlinuxarm_filename}"
+    rm -f "${build_image_file}"
+
+    IMG_SIZE="$((skip_mb + boot_mb + root_mb))"
+    truncate -s "${IMG_SIZE}M" "${build_image_file}" >/dev/null 2>&1
+
+    parted -s "${build_image_file}" mklabel "${partition_table_type}" 2>/dev/null
+    parted -s "${build_image_file}" mkpart primary "${bootfs_type}" "$((skip_mb))MiB" "$((skip_mb + boot_mb - 1))MiB" 2>/dev/null
+    parted -s "${build_image_file}" mkpart primary "${rootfs_type}" "$((skip_mb + boot_mb))MiB" 100% 2>/dev/null
+
+    loop_new="$(losetup -P -f --show "${build_image_file}")"
+    [[ -n "${loop_new}" ]] || error_msg "losetup ${build_image_file} failed."
+
+    BOOT_UUID="$(cat /proc/sys/kernel/random/uuid)"
+    [[ -z "${BOOT_UUID}" ]] && BOOT_UUID="$(uuidgen 2>/dev/null)"
+    [[ -z "${BOOT_UUID}" ]] && error_msg "The uuidgen is invalid, cannot continue."
+    ROOTFS_UUID="$(cat /proc/sys/kernel/random/uuid)"
+    [[ -z "${ROOTFS_UUID}" ]] && ROOTFS_UUID="$(uuidgen 2>/dev/null)"
+    [[ -z "${ROOTFS_UUID}" ]] && error_msg "The uuidgen is invalid, cannot continue."
+
+    if [[ "${bootfs_type}" == "fat32" ]]; then
+        mkfs.vfat -F 32 -n "BOOT" "${loop_new}p1" >/dev/null 2>&1
+    else
+        mkfs.ext4 -F -q -U "${BOOT_UUID}" -L "BOOT" -b 4k -m 0 "${loop_new}p1" >/dev/null 2>&1
+    fi
+
+    if [[ "${rootfs_type}" == "btrfs" ]]; then
+        mkfs.btrfs -f -U "${ROOTFS_UUID}" -L "ROOTFS" -m single "${loop_new}p2" >/dev/null 2>&1
+    else
+        mkfs.ext4 -F -q -U "${ROOTFS_UUID}" -L "ROOTFS" -b 4k -m 0 "${loop_new}p2" >/dev/null 2>&1
+    fi
+
+    if [[ "${PLATFORM}" == "amlogic" ]]; then
+        bootloader_path="${uboot_path}/${PLATFORM}/bootloader"
+        if [[ -n "${MAINLINE_UBOOT}" && -f "${bootloader_path}/${MAINLINE_UBOOT}" ]]; then
+            dd if="${bootloader_path}/${MAINLINE_UBOOT}" of="${loop_new}" conv=fsync bs=1 count=444 2>/dev/null
+            dd if="${bootloader_path}/${MAINLINE_UBOOT}" of="${loop_new}" conv=fsync bs=512 skip=1 seek=1 2>/dev/null
+        elif [[ -n "${BOOTLOADER_IMG}" && -f "${bootloader_path}/${BOOTLOADER_IMG}" ]]; then
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync bs=1 count=444 2>/dev/null
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync bs=512 skip=1 seek=1 2>/dev/null
+        fi
+    fi
+
+    if [[ "${PLATFORM}" == "rockchip" ]]; then
+        bootloader_path="${uboot_path}/${PLATFORM}/${board}"
+        if [[ -n "${BOOTLOADER_IMG}" && -f "${bootloader_path}/${BOOTLOADER_IMG}" ]] &&
+            [[ -n "${MAINLINE_UBOOT}" && -f "${bootloader_path}/${MAINLINE_UBOOT}" ]] &&
+            [[ -n "${TRUST_IMG}" && -f "${bootloader_path}/${TRUST_IMG}" ]]; then
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync,notrunc bs=512 seek=64 2>/dev/null
+            dd if="${bootloader_path}/${MAINLINE_UBOOT}" of="${loop_new}" conv=fsync,notrunc bs=512 seek=16384 2>/dev/null
+            dd if="${bootloader_path}/${TRUST_IMG}" of="${loop_new}" conv=fsync,notrunc bs=512 seek=24576 2>/dev/null
+        elif [[ -n "${BOOTLOADER_IMG}" && -f "${bootloader_path}/${BOOTLOADER_IMG}" ]] &&
+            [[ -n "${MAINLINE_UBOOT}" && -f "${bootloader_path}/${MAINLINE_UBOOT}" ]]; then
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync,notrunc bs=512 seek=64 2>/dev/null
+            dd if="${bootloader_path}/${MAINLINE_UBOOT}" of="${loop_new}" conv=fsync,notrunc bs=512 seek=16384 2>/dev/null
+        elif [[ "${BOOTLOADER_IMG}" == "u-boot-rockchip.bin" && -f "${bootloader_path}/${BOOTLOADER_IMG}" ]]; then
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync,notrunc bs=512 seek=64 2>/dev/null
+        elif [[ -n "${BOOTLOADER_IMG}" && -f "${bootloader_path}/${BOOTLOADER_IMG}" ]]; then
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync,notrunc bs=512 skip=64 seek=64 2>/dev/null
+        fi
+    fi
+
+    if [[ "${PLATFORM}" == "allwinner" ]]; then
+        bootloader_path="${uboot_path}/${PLATFORM}/${board}"
+        if [[ -n "${BOOTLOADER_IMG}" && -f "${bootloader_path}/${BOOTLOADER_IMG}" ]] &&
+            [[ -n "${MAINLINE_UBOOT}" && -f "${bootloader_path}/${MAINLINE_UBOOT}" ]]; then
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync,notrunc bs=8k seek=1 2>/dev/null
+            dd if="${bootloader_path}/${MAINLINE_UBOOT}" of="${loop_new}" conv=fsync,notrunc bs=8k seek=5 2>/dev/null
+        elif [[ -n "${BOOTLOADER_IMG}" && -f "${bootloader_path}/${BOOTLOADER_IMG}" ]]; then
+            dd if=/dev/zero of="${loop_new}" bs=1k count=1023 seek=1 status=noxfer 2>/dev/null
+            dd if="${bootloader_path}/${BOOTLOADER_IMG}" of="${loop_new}" conv=fsync,notrunc bs=8k seek=1 2>/dev/null
+        fi
+    fi
+
+    if [[ "${write_board_file}" == "yes" ]]; then
+        if declare -F write_board_bootloader >/dev/null 2>&1; then
+            write_board_bootloader
+        else
+            echo -e "${WARNING} write_board_file=yes but write_board_bootloader is not defined; skip board hook."
+        fi
+    fi
+}
+
+extract_rootfs_tarball() {
+    local tarball="${1}"
+    local target="${2}"
+    case "${tarball}" in
+    *.tar.gz | *.tgz)
+        tar --numeric-owner -xzf "${tarball}" -C "${target}"
+        ;;
+    *.tar.xz | *.txz)
+        tar --numeric-owner -xJf "${tarball}" -C "${target}"
+        ;;
+    *.tar.zst | *.tzst)
+        tar --numeric-owner --zstd -xf "${tarball}" -C "${target}"
+        ;;
+    *.tar)
+        tar --numeric-owner -xf "${tarball}" -C "${target}"
+        ;;
+    *)
+        error_msg "Unsupported rootfs tarball type: [ ${tarball} ]"
+        ;;
+    esac
+}
+
+copy_files() {
+    process_msg "(2/6) Extract Arch rootfs and copy boot assets."
+
+    tag_bootfs="${tmp_build}/bootfs"
+    tag_rootfs="${tmp_build}/rootfs"
+    mkdir -p "${tag_bootfs}" "${tag_rootfs}"
+    chown root:root "${tag_bootfs}" "${tag_rootfs}"
+
+    if [[ "${bootfs_type}" == "fat32" ]]; then
+        mount_try vfat "${loop_new}p1" "${tag_bootfs}"
+    else
+        mount_try ext4 "${loop_new}p1" "${tag_bootfs}"
+    fi
+
+    if [[ "${rootfs_type}" == "btrfs" ]]; then
+        mount_try btrfs "${loop_new}p2" "${tag_rootfs}"
+    else
+        mount_try ext4 "${loop_new}p2" "${tag_rootfs}"
+    fi
+
+    extract_rootfs_tarball "${arch_rootfs_file}" "${tag_rootfs}" || error_msg "Arch rootfs extraction failed."
+    [[ -n "${tag_rootfs}" ]] || error_msg "The rootfs mount path is empty."
+    rm -rf "${tag_rootfs:?}/boot"/* "${tag_rootfs:?}/usr/lib/modules"/* 2>/dev/null
+
+    [[ -d "${arch_common_files}" ]] && cp -af --no-preserve=ownership "${arch_common_files}/." "${tag_rootfs}"
+
+    platform_bootfs="${platform_files}/${PLATFORM}/bootfs"
+    [[ -d "${platform_bootfs}" ]] && cp -rf "${platform_bootfs}/." "${tag_bootfs}"
+
+    arch_platform_bootfs="${arch_platform_files}/${PLATFORM}/bootfs"
+    arch_platform_rootfs="${arch_platform_files}/${PLATFORM}/rootfs"
+    [[ -d "${arch_platform_bootfs}" ]] && cp -rf "${arch_platform_bootfs}/." "${tag_bootfs}"
+    [[ -d "${arch_platform_rootfs}" ]] && cp -af --no-preserve=ownership "${arch_platform_rootfs}/." "${tag_rootfs}"
+
+    different_bootfs="${different_files}/${board}/bootfs"
+    [[ -d "${different_bootfs}" ]] && cp -rf "${different_bootfs}/." "${tag_bootfs}"
+
+    mkdir -p "${tag_rootfs}/usr/lib/u-boot"
+    rm -rf "${tag_rootfs}/usr/lib/u-boot"/* 2>/dev/null
+    [[ -d "${bootloader_path}" ]] && cp -af --no-preserve=ownership "${bootloader_path}/." "${tag_rootfs}/usr/lib/u-boot"
+
+    if [[ "${PLATFORM}" == "amlogic" ]]; then
+        [[ -d "${uboot_path}/${PLATFORM}/overload" ]] || error_msg "Missing Amlogic u-boot overload files: [ ${uboot_path}/${PLATFORM}/overload ]"
+        cp -rf "${uboot_path}/${PLATFORM}/overload/." "${tag_bootfs}"
+    fi
+
+    if [[ -d "${firmware_path}" ]]; then
+        mkdir -p "${tag_rootfs}/usr/lib/firmware"
+        cp -af --no-preserve=ownership "${firmware_path}/." "${tag_rootfs}/usr/lib/firmware"
+    fi
+
+    find "${tmp_build}" -type d -name '.git' -prune -exec rm -rf {} + 2>/dev/null || true
+}
+
+replace_kernel() {
+    process_msg "(3/6) Install ophub kernel files."
+
+    kernel_boot="$(find "${kernel_path}/${conf_kernel_tags}/${kernel}" -maxdepth 1 -type f -name "boot-${kernel}*.tar.gz" 2>/dev/null | sort | awk 'NR==1 {print}')"
+    kernel_name="${kernel_boot##*/}"
+    kernel_name="${kernel_name:5:-7}"
+    [[ -n "${kernel_name}" ]] || error_msg "Missing kernel files for [ ${kernel} ]"
+    kernel_signature="${kernel_name#*-}"
+    [[ -n "${kernel_signature}" ]] || error_msg "Missing kernel signature: [ ${kernel_name} ]"
+
+    kernel_dtb="${kernel_path}/${conf_kernel_tags}/${kernel}/dtb-${PLATFORM}-${kernel_name}.tar.gz"
+    kernel_modules="${kernel_path}/${conf_kernel_tags}/${kernel}/modules-${kernel_name}.tar.gz"
+    kernel_header="${kernel_path}/${conf_kernel_tags}/${kernel}/header-${kernel_name}.tar.gz"
+    [[ -s "${kernel_boot}" && -s "${kernel_dtb}" && -s "${kernel_modules}" ]] || error_msg "The kernel boot/dtb/modules files are missing."
+
+    tar -mxzf "${kernel_boot}" -C "${tag_bootfs}"
+    [[ "${PLATFORM}" == "allwinner" ]] && (cd "${tag_bootfs}" && cp -f "uInitrd-${kernel_name}" uInitrd && cp -f "vmlinuz-${kernel_name}" Image)
+    [[ "${PLATFORM}" == "amlogic" ]] && (cd "${tag_bootfs}" && cp -f "uInitrd-${kernel_name}" uInitrd && cp -f "vmlinuz-${kernel_name}" zImage)
+    [[ "${PLATFORM}" == "rockchip" ]] && (cd "${tag_bootfs}" && ln -sf "uInitrd-${kernel_name}" uInitrd && ln -sf "vmlinuz-${kernel_name}" Image)
+    boot_kernel_file_count="$(find "${tag_bootfs}" -maxdepth 1 -type f -name "*${kernel_name}" 2>/dev/null | wc -l)"
+    [[ "${boot_kernel_file_count}" -ge "2" ]] || error_msg "The /boot files are missing."
+    [[ "${PLATFORM}" == "amlogic" ]] && get_textoffset "${tag_bootfs}/zImage"
+
+    mkdir -p "${tag_bootfs}/dtb/${PLATFORM}"
+    tar -mxzf "${kernel_dtb}" -C "${tag_bootfs}/dtb/${PLATFORM}"
+    [[ "${PLATFORM}" == "rockchip" ]] && ln -sf dtb "${tag_bootfs}/dtb-${kernel_name}"
+    boot_dtb_file_count="$(find "${tag_bootfs}/dtb/${PLATFORM}" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+    [[ "${boot_dtb_file_count}" -ge "1" ]] || error_msg "/boot/dtb/${PLATFORM} files are missing."
+
+    mkdir -p "${tag_rootfs}/usr/lib/modules"
+    tar -mxzf "${kernel_modules}" -C "${tag_rootfs}/usr/lib/modules"
+    [[ -d "${tag_rootfs}/usr/lib/modules/${kernel_name}" ]] || error_msg "/usr/lib/modules/${kernel_name} folder is missing."
+
+    if [[ -s "${kernel_header}" ]]; then
+        header_path="linux-headers-${kernel_name}"
+        rm -rf "${tag_rootfs}/usr/src"/linux-headers-* 2>/dev/null
+        mkdir -p "${tag_rootfs}/usr/src/${header_path}"
+        tar -mxzf "${kernel_header}" -C "${tag_rootfs}/usr/src/${header_path}"
+        [[ -d "${tag_rootfs}/usr/src/${header_path}/include" ]] || error_msg "/usr/src/${header_path}/include folder is missing."
+        (cd "${tag_rootfs}/usr/lib/modules/${kernel_name}/" && rm -f build source 2>/dev/null && ln -sf "/usr/src/${header_path}" build)
+    fi
+
+    if [[ "${adjust_kernel_files}" == "yes" ]]; then
+        if declare -F adjust_kernel_files_cmd >/dev/null 2>&1; then
+            adjust_kernel_files_cmd
+        else
+            echo -e "${WARNING} adjust_kernel_files=yes but adjust_kernel_files_cmd is not defined; skip board hook."
+        fi
+    fi
+}
+
+refactor_bootfs() {
+    process_msg "(4/6) Refactor bootfs files."
+    cd "${tag_bootfs}" || error_msg "Cannot enter bootfs: [ ${tag_bootfs} ]"
+
+    if [[ "${PLATFORM}" == "amlogic" && "${need_overload}" == "yes" ]]; then
+        if [[ -n "${UBOOT_OVERLOAD}" && -f "${UBOOT_OVERLOAD}" ]]; then
+            cp -f "${UBOOT_OVERLOAD}" u-boot.ext
+            chmod +x u-boot.ext
+        else
+            error_msg "${board} board does not support using ${kernel} kernel, missing u-boot overload: [ ${UBOOT_OVERLOAD} ]."
+        fi
+    fi
+
+    if [[ "${rootfs_type}" == "btrfs" ]]; then
+        uenv_rootdev="UUID=${ROOTFS_UUID} rootflags=compress=zstd:6 rw rootwait rootfstype=btrfs"
+        armbianenv_rootdev="UUID=${ROOTFS_UUID}"
+        armbianenv_rootflags="compress=zstd:6"
+    else
+        uenv_rootdev="UUID=${ROOTFS_UUID} rootflags=data=writeback rw rootwait rootfstype=ext4"
+        armbianenv_rootdev="UUID=${ROOTFS_UUID}"
+        armbianenv_rootflags="rw,errors=remount-ro"
+    fi
+
+    uenv_conf_file="uEnv.txt"
+    [[ -f "${uenv_conf_file}" ]] && {
+        sed -i \
+            -e "s|LABEL=ROOTFS|${uenv_rootdev}|g" \
+            -e "s|meson.*.dtb|${FDTFILE}|g" \
+            -e "s|sun.*.dtb|${FDTFILE}|g" \
+            -e "s|rk.*.dtb|${FDTFILE}|g" \
+            "${uenv_conf_file}"
+    }
+
+    boot_extlinux_file="extlinux/extlinux.conf.bak"
+    rename_extlinux_file="extlinux/extlinux.conf"
+    [[ -f "${boot_extlinux_file}" ]] && {
+        sed -i \
+            -e "s|LABEL=ROOTFS|${uenv_rootdev}|g" \
+            -e "s|meson.*.dtb|${FDTFILE}|g" \
+            -e "s|sun.*.dtb|${FDTFILE}|g" \
+            -e "s|rk.*.dtb|${FDTFILE}|g" \
+            "${boot_extlinux_file}"
+        [[ "${BOOT_CONF}" == "extlinux.conf" ]] && mv -f "${boot_extlinux_file}" "${rename_extlinux_file}"
+    }
+
+    armbianenv_conf_file="armbianEnv.txt"
+    [[ -f "${armbianenv_conf_file}" ]] && {
+        sed -i \
+            -e "s|\(fdtfile=.*\/\)[^/]*$|\1${FDTFILE}|g" \
+            -e "s|^rootfstype=.*|rootfstype=${rootfs_type}|g" \
+            -e "s|^rootdev=.*|rootdev=${armbianenv_rootdev}|g" \
+            -e "s|^rootflags=.*|rootflags=${armbianenv_rootflags}|g" \
+            -e "s|^overlay_prefix=.*|overlay_prefix=${FAMILY}|g" \
+            "${armbianenv_conf_file}"
+    }
+
+    [[ -f "${uenv_conf_file}" || -f "${rename_extlinux_file}" || -f "${armbianenv_conf_file}" ]] || error_msg "Missing [ /boot/*Env.txt ]"
+}
+
+enable_systemd_service() {
+    local unit="${1}"
+    local wants="etc/systemd/system/multi-user.target.wants"
+    mkdir -p "${wants}"
+    if [[ -f "usr/lib/systemd/system/${unit}" ]]; then
+        ln -sf "/usr/lib/systemd/system/${unit}" "${wants}/${unit}"
+    else
+        echo -e "${WARNING} Missing systemd unit in rootfs: [ ${unit} ]"
+    fi
+}
+
+append_sshd_option() {
+    local option="${1}"
+    local value="${2}"
+    local file="etc/ssh/sshd_config"
+    [[ -f "${file}" ]] || return 0
+    if grep -qE "^#*${option}[[:space:]]+" "${file}"; then
+        sed -i "s|^#*${option}[[:space:]].*|${option} ${value}|g" "${file}"
+    else
+        printf '\n%s %s\n' "${option}" "${value}" >>"${file}"
+    fi
+}
+
+refactor_rootfs() {
+    process_msg "(5/6) Refactor Arch rootfs files."
+    cd "${tag_rootfs}" || error_msg "Cannot enter rootfs: [ ${tag_rootfs} ]"
+
+    release_codeid="$(awk -F'=' '$1 == "ID" {gsub(/\"/, "", $2); print $2; exit}' etc/os-release 2>/dev/null)"
+    [[ -n "${release_codeid}" ]] || release_codeid="archlinuxarm"
+    release_codename="$(awk -F'=' '$1 == "VERSION_CODENAME" {gsub(/\"/, "", $2); print $2; exit}' etc/os-release 2>/dev/null)"
+    [[ -n "${release_codename}" ]] || release_codename="rolling"
+    arch_release_version="$(awk -F'=' '$1 == "VERSION_ID" {gsub(/\"/, "", $2); print $2; exit}' etc/os-release 2>/dev/null)"
+    [[ -n "${arch_release_version}" ]] || arch_release_version="rolling"
+
+    mkdir -p etc usr/lib/modules usr/src root
+
+    if [[ "${rootfs_type}" == "btrfs" ]]; then
+        fstab_string="defaults,noatime,compress=zstd:6"
+    else
+        fstab_string="defaults,noatime,nodiratime,commit=600,errors=remount-ro"
+    fi
+    cat >etc/fstab <<EOF
+UUID=${ROOTFS_UUID}  /      ${rootfs_type}  ${fstab_string}  0 1
+LABEL=BOOT          /boot  vfat            defaults          0 2
+tmpfs               /tmp   tmpfs           defaults,nosuid   0 0
+EOF
+
+    pacman_conf="etc/pacman.conf"
+    if [[ -f "${pacman_conf}" ]] && ! grep -qE '^IgnorePkg[[:space:]]*=.*linux-aarch64' "${pacman_conf}"; then
+        sed -i '/^\[options\]/a IgnorePkg = linux-aarch64 linux-aarch64-headers linux-headers-aarch64' "${pacman_conf}"
+    fi
+
+    mkdir -p etc/ssh/sshd_config.d
+    append_sshd_option PermitRootLogin yes
+    append_sshd_option PasswordAuthentication yes
+    append_sshd_option UsePAM yes
+
+    enable_systemd_service sshd.service
+    enable_systemd_service systemd-networkd.service
+    enable_systemd_service systemd-resolved.service
+    ln -sf ../run/systemd/resolve/stub-resolv.conf etc/resolv.conf
+
+    [[ -d "var/tmp" ]] && chmod 1777 var/tmp
+    [[ -d "tmp" ]] && chmod 1777 tmp
+    : >etc/machine-id
+    echo "yes" >root/.no_rootfs_resize
+
+    release_lines=(
+        "PLATFORM='${PLATFORM}'"
+        "VERSION_CODEID='${release_codeid}'"
+        "VERSION_CODENAME='${release_codename}'"
+        "VERSION='${arch_release_version}'"
+        "MODEL_ID='${MODEL_ID}'"
+        "MODEL_NAME='${MODEL_NAME}'"
+        "SOC='${SOC}'"
+        "FDTFILE='${FDTFILE}'"
+        "FAMILY='${FAMILY}'"
+        "BOARD='${board}'"
+        "KERNEL_REPO='${kernel_repo}'"
+        "KERNEL_TAGS='${conf_kernel_tags}'"
+        "KERNEL_VERSION='${kernel}'"
+        "KERNEL_NAME='${kernel_name}'"
+        "KERNEL_SIGNATURE='${kernel_signature}'"
+        "DOWNLOAD_TYPE='tar'"
+        "KERNEL_BACKUP='no'"
+        "BOOT_CONF='${BOOT_CONF}'"
+        "ROOTFS_TYPE='${rootfs_type}'"
+        "DISK_TYPE='usb'"
+        "MAINLINE_UBOOT='${RECORD_MAINLINE_UBOOT}'"
+        "BOOTLOADER_IMG='${RECORD_BOOTLOADER_IMG}'"
+        "BUILD_REPOSITORY='archlinuxarm.org'"
+        "REBUILD_REPOSITORY='github.com/ophub/amlogic-s9xxx-armbian'"
+        "CONTRIBUTORS='${CONTRIBUTORS}'"
+        "BUILDER_NAME='${builder_name}'"
+        "TARGET_MODEL='${target_model}'"
+        "ROOTFS_SOURCE='$(basename "${arch_rootfs_file}")'"
+        "PACKAGED_DATE='$(date +%Y-%m-%d)'"
+    )
+    [[ "${PLATFORM}" == "rockchip" ]] && release_lines+=("TRUST_IMG='${RECORD_TRUST_IMG}'")
+    [[ "${PLATFORM}" == "amlogic" ]] && release_lines+=("UBOOT_OVERLOAD='${UBOOT_OVERLOAD}'")
+    printf '%s\n' "${release_lines[@]}" >etc/ophub-release
+
+    sync
+}
+
+clean_tmp() {
+    process_msg "(6/6) Clear temporary files."
+    cd "${current_path}" || exit 1
+
+    fstrim "${tag_bootfs}" 2>/dev/null || true
+    fstrim "${tag_rootfs}" 2>/dev/null || true
+    umount -f "${tag_bootfs}" 2>/dev/null || true
+    umount -f "${tag_rootfs}" 2>/dev/null || true
+    losetup -d "${loop_new}" 2>/dev/null || true
+    loop_new=""
+
+    cd "${tmp_outpath}" || error_msg "Cannot enter output temp path: [ ${tmp_outpath} ]"
+    if command -v pigz >/dev/null 2>&1; then
+        pigz -qf "${archlinuxarm_filename}"
+    else
+        gzip -qf "${archlinuxarm_filename}"
+    fi
+    mv -f "${archlinuxarm_filename}"* -t "${armbian_outputpath}"
+
+    cd "${current_path}" || exit 1
+    rm -rf "${tmp_dir}"
+    sync
+}
+
+loop_rebuild() {
+    cd "${current_path}" || exit 1
+    echo -e "${STEPS} Building Arch Linux ARM images..."
+
+    local j i b k avail_kib now_remaining_space
+    j="1"
+    for b in "${build_arch[@]}"; do
+        board="${b}"
+        confirm_version
+
+        i="1"
+        for k in "${build_kernel[@]}"; do
+            kernel="${k}"
+            echo -ne "(${j}.${i}) Building Arch Linux ARM [\033[92m ${MODEL_NAME} / ${board} - ${conf_kernel_tags}/${kernel} \033[0m]. "
+            avail_kib="$(df -Pk "${armbian_outputpath}" | awk 'NR==2 {print $4}')"
+            now_remaining_space=$((${avail_kib:-0} / 1024 / 1024))
+            if [[ "${now_remaining_space}" -le 6 ]]; then
+                echo -e "${WARNING} Remaining space is less than 6 GiB. Skipping this build."
+                break
+            else
+                echo "Remaining space: ${now_remaining_space} GiB."
+            fi
+
+            rm -rf "${tmp_dir}"
+            mkdir -p "${tmp_outpath}" "${tmp_build}"
+
+            make_image
+            copy_files
+            replace_kernel
+            refactor_bootfs
+            refactor_rootfs
+            clean_tmp
+
+            echo -e "(${j}.${i}) Arch Linux ARM image built successfully.\n"
+            ((i++))
+        done
+        ((j++))
+    done
+}
+
+echo -e "${STEPS} Welcome to the Arch Linux ARM Rebuild Tool!"
+echo -e "${INFO} Phase 1 target: [ ${target_model} / ${default_board} ]\n"
+
+init_var "${@}"
+check_host
+check_data
+download_arch_rootfs
+download_depends
+[[ "${auto_kernel}" =~ ^(true|yes)$ ]] && query_kernel
+download_kernel
+
+echo -e "${INFO} [ ${#build_arch[@]} ] Arch board list: [ $(echo "${build_arch[@]}" | xargs) ]"
+echo -e "${INFO} Rootfs file: [ ${arch_rootfs_file} ]"
+echo -e "${INFO} Rootfs type: [ ${rootfs_type} ]"
+echo -e "${INFO} Kernel Repo: [ ${kernel_repo} ], Kernel Usage: [ ${kernel_usage:-default} ], Auto Kernel: [ ${auto_kernel} ]\n"
+echo -e "${INFO} Server space usage before starting to build:\n$(df -hT "${armbian_outputpath}")\n"
+
+loop_rebuild
+
+echo -e "${STEPS} Server space usage after build:\n$(df -hT "${armbian_outputpath}")\n"
+echo -e "${SUCCESS} All processes completed successfully."

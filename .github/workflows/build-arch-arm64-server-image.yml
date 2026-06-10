@@ -1,0 +1,213 @@
+#==========================================================================
+# Description: Build Arch Linux ARM arm64 server image
+# Copyright (C) 2021 https://github.com/ophub/amlogic-s9xxx-armbian
+#==========================================================================
+
+name: Build Arch Linux ARM arm64 server image
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      arch_board:
+        description: "Select device board or model."
+        required: false
+        default: "s905-beelink-mini"
+        type: choice
+        options:
+          - s905-beelink-mini
+          - Beelink-Mini-MX-2G
+      arch_rootfs_url:
+        description: "Set Arch Linux ARM rootfs URL."
+        required: false
+        default: "https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+        type: string
+      arch_kernel:
+        description: "Select kernel version."
+        required: false
+        default: "6.12.y_6.18.y"
+        type: choice
+        options:
+          - 5.10.y
+          - 5.15.y
+          - 6.1.y
+          - 6.6.y
+          - 6.12.y
+          - 6.18.y
+          - 5.10.y_5.15.y
+          - 6.1.y_6.6.y
+          - 6.12.y_6.18.y
+          - 6.1.y_6.12.y
+          - 6.1.y_6.18.y
+      auto_kernel:
+        description: "Auto use the latest matching kernel."
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      kernel_repo:
+        description: "Set the kernel repository."
+        required: false
+        default: "ophub/kernel"
+        type: choice
+        options:
+          - ophub/kernel
+      kernel_usage:
+        description: "Set the tags of the stable kernel."
+        required: false
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - flippy
+          - beta
+      arch_fstype:
+        description: "Select Arch Linux ARM rootfs type."
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+      arch_size:
+        description: "Set BOOTFS/ROOTFS partition size in MiB."
+        required: false
+        default: "512/3000"
+        type: string
+      builder_name:
+        description: "Set Arch Linux ARM builder signature."
+        required: false
+        default: "ophub"
+        type: choice
+        options:
+          - ophub
+          - angel
+
+env:
+  TZ: Etc/UTC
+  ARCH_EDITION: server
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+
+    name: build-archlinuxarm-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize the build environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
+          sudo -E apt-get -y install shellcheck
+          sudo -E systemctl daemon-reload
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo -E timedatectl set-timezone "${TZ:-Etc/UTC}"
+          sudo -E ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo -E timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Create virtual disk for extended storage
+        id: disk
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6
+          sudo pvcreate /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner:runner /builder
+          mkdir -p /builder/build /builder/kernel /builder/rootfs /builder/u-boot
+          rm -rf build build-armbian/kernel build-armbian/u-boot build-archlinuxarm/rootfs
+          ln -sfn /builder/build build
+          ln -sfn /builder/kernel build-armbian/kernel
+          ln -sfn /builder/rootfs build-archlinuxarm/rootfs
+          ln -sfn /builder/u-boot build-armbian/u-boot
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Validate Arch builder script
+        id: validate
+        if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
+        run: |
+          chmod +x rebuild-arch
+          bash -n rebuild-arch
+          shellcheck rebuild-arch
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Build Arch Linux ARM image
+        id: build
+        if: ${{ steps.validate.outputs.status == 'success' && !cancelled() }}
+        run: |
+          make_args=()
+          [[ -n "${{ inputs.arch_board }}"      ]] && make_args+=(-b "${{ inputs.arch_board }}")
+          [[ -n "${{ inputs.arch_rootfs_url }}" ]] && make_args+=(-d "${{ inputs.arch_rootfs_url }}")
+          [[ -n "${{ inputs.kernel_repo }}"     ]] && make_args+=(-r "${{ inputs.kernel_repo }}")
+          [[ -n "${{ inputs.kernel_usage }}"    ]] && make_args+=(-u "${{ inputs.kernel_usage }}")
+          [[ -n "${{ inputs.arch_kernel }}"     ]] && make_args+=(-k "${{ inputs.arch_kernel }}")
+          [[ -n "${{ inputs.auto_kernel }}"     ]] && make_args+=(-a "${{ inputs.auto_kernel }}")
+          [[ -n "${{ inputs.arch_fstype }}"     ]] && make_args+=(-t "${{ inputs.arch_fstype }}")
+          [[ -n "${{ inputs.arch_size }}"       ]] && make_args+=(-s "${{ inputs.arch_size }}")
+          [[ -n "${{ inputs.builder_name }}"    ]] && make_args+=(-n "${{ inputs.builder_name }}")
+          sudo ./rebuild-arch "${make_args[@]}"
+
+          shopt -s nullglob
+          images=(build/output/images/*.img.gz)
+          shopt -u nullglob
+          if [[ "${#images[@]}" -eq 0 ]]; then
+            echo "error: No .img.gz file produced in build/output/images, aborting."
+            exit 1
+          fi
+          ls -lh "${images[@]}"
+          board_tag="${{ inputs.arch_board }}"
+          [[ -z "${board_tag}" ]] && board_tag="s905-beelink-mini"
+          echo "build_tag=ArchLinuxARM_${board_tag}_arm64_${ARCH_EDITION}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Upload Arch Linux ARM image to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ steps.build.outputs.status == 'success' && !cancelled() }}
+        with:
+          tag: ${{ env.build_tag }}
+          artifacts: build/output/images/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### Arch Linux ARM Image Information
+            - Target device: `Beelink-Mini-MX-2G`
+            - Default root account: `root` / `root`
+            - Default user account: `alarm` / `alarm`
+            - Package manager: `pacman`
+            - Kernel packages are protected with `IgnorePkg` in `/etc/pacman.conf`.
+            ### Applicable Platform
+            - arm64
