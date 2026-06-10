@@ -35,7 +35,7 @@ tmp_build="${tmp_dir}/tmp_build"
 rootfs_cache="${arch_build_path}/rootfs"
 
 # Arch Linux ARM rootfs
-arch_rootfs_url="https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+arch_rootfs_url="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
 arch_rootfs_file="${rootfs_cache}/ArchLinuxARM-aarch64-latest.tar.gz"
 custom_rootfs="no"
 

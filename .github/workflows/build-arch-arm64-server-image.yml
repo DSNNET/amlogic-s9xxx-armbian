@@ -23,7 +23,7 @@ on:
       arch_rootfs_url:
         description: "Set Arch Linux ARM rootfs URL."
         required: false
-        default: "https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+        default: "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
         type: string
       arch_kernel:
         description: "Select kernel version."
